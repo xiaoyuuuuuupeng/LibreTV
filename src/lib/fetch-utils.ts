@@ -1,6 +1,6 @@
 /** 服务端上游请求工具：超时、重试、安全跳转、JSON 解析 */
 
-import { allowLivePrivate, checkLiveUrlAllowed, checkUpstreamAllowed, runWithSSRFProtection } from './ssrf';
+import { allowLivePrivate, checkLiveUrlAllowed, checkUpstreamAllowed, isWorkersRuntime, runWithSSRFProtection } from './ssrf';
 
 export interface FetchOptions extends RequestInit {
   timeoutMs?: number;
@@ -160,7 +160,8 @@ export async function fetchUpstreamWithMeta(url: string, options: FetchOptions =
   let lastError: unknown;
   for (let attempt = 0; attempt <= retries; attempt++) {
     try {
-      if (!safeRedirects) {
+      // Workers 不允许 native fetch 自动跳转；始终由逐跳校验路径处理。
+      if (!safeRedirects && !isWorkersRuntime()) {
         try {
           const res = await runWithSSRFProtection({ allowPrivate: connectAllowPrivate }, () =>
             fetch(url, {

@@ -72,6 +72,85 @@ export async function isBlockedByDNS(urlString: string): Promise<boolean> {
 
 export type UpstreamVerdict = { ok: true } | { ok: false; reason: string };
 
+/** Cloudflare Workers 使用平台原生 fetch；Node.js 始终保留连接级 Agent。 */
+export function isWorkersRuntime(): boolean {
+  return typeof navigator !== 'undefined' && navigator.userAgent === 'Cloudflare-Workers';
+}
+
+/**
+ * Workers 原生 fetch 不支持连接时自定义 DNS lookup。
+ * 仅允许部署者显式信任的 HTTPS origin（不接受通配符/IP/用户信息/非标准端口）。
+ * 部署必须同时开启 global_fetch_strictly_public，由平台限制实际出站路径。
+ */
+function workersOrigin(urlString: string): string | null {
+  try {
+    const url = new URL(urlString);
+    const host = url.hostname;
+    if (url.protocol !== 'https:' || url.username || url.password || url.port
+      || !isValidProxyUrl(urlString) || !host.includes('.') || host.endsWith('.')
+      || /^\d+(\.\d+){3}$/.test(host) || host.includes(':')) return null;
+    return url.origin;
+  } catch {
+    return null;
+  }
+}
+
+function checkWorkersOrigin(urlString: string): UpstreamVerdict {
+  const origin = workersOrigin(urlString);
+  const allowed = (process.env.LIBRETV_WORKERS_ALLOWED_ORIGINS || '')
+    .split(',')
+    .map((entry) => entry.trim())
+    .filter((entry) => entry !== '' && workersOrigin(entry) === entry);
+  if (!origin || !allowed.includes(origin)) {
+    return { ok: false, reason: 'Workers 仅允许 LIBRETV_WORKERS_ALLOWED_ORIGINS 中的可信 HTTPS origin' };
+  }
+  return { ok: true };
+}
+
+/** Workers 专用预检：DNS 失败、无记录或私网记录均拒绝，不降级放行。 */
+async function checkWorkersUpstream(urlString: string): Promise<UpstreamVerdict> {
+  const verdict = checkWorkersOrigin(urlString);
+  if (!verdict.ok) return verdict;
+  try {
+    const addresses = await dns.lookup(new URL(urlString).hostname, { all: true });
+    if (addresses.length === 0 || addresses.some((entry) => isPrivateIP(entry.address))) {
+      return { ok: false, reason: 'Workers 目标 DNS 未返回可用公网地址' };
+    }
+  } catch {
+    return { ok: false, reason: 'Workers 目标 DNS 校验失败' };
+  }
+  return { ok: true };
+}
+
+/**
+ * Workers 原生请求：不传 dispatcher/cf/resolveOverride，不自动跟随重定向。
+ * DNS 预检并不是 IP pinning；安全边界还依赖可信 origin 与平台公网路由。
+ */
+export async function fetchWorkersPublic(
+  nativeFetch: typeof fetch,
+  input: RequestInfo | URL,
+  init?: RequestInit
+): Promise<Response> {
+  // 不透传 Request 对象中可能携带的 Workers 专有路由属性。
+  if (typeof input !== 'string' && !(input instanceof URL)) {
+    throw new Error('Workers 受保护请求仅接受 URL');
+  }
+  const url = String(input);
+  const verdict = await checkWorkersUpstream(url);
+  if (!verdict.ok) throw new Error(`连接目标被拒绝: ${verdict.reason}`);
+  const headers = new Headers(init?.headers);
+  if (headers.has('host')) throw new Error('Workers 受保护请求不允许覆盖 Host');
+  // 仅透传应用所需的标准属性；手动跳转由 fetch-utils 逐跳校验。
+  return nativeFetch(url, {
+    method: init?.method,
+    headers,
+    body: init?.body,
+    signal: init?.signal,
+    redirect: 'manual',
+    ...(init?.cache === 'no-store' ? { cache: 'no-store' as const } : {}),
+  });
+}
+
 /**
  * 出网请求的统一校验入口：字面量校验 + DNS 解析校验。
  *
@@ -79,6 +158,7 @@ export type UpstreamVerdict = { ok: true } | { ok: false; reason: string };
  * 否则服务器会变成内网探测跳板（/api/search 曾直接用用户传的 source.url 发请求）。
  */
 export async function checkUpstreamAllowed(urlString: string): Promise<UpstreamVerdict> {
+  if (isWorkersRuntime()) return checkWorkersUpstream(urlString);
   if (!isValidProxyUrl(urlString)) {
     return { ok: false, reason: '目标地址不在允许范围内（仅支持公网 http/https）' };
   }
@@ -90,7 +170,7 @@ export async function checkUpstreamAllowed(urlString: string): Promise<UpstreamV
 
 /** 直播场景是否放行内网地址（自建 IPTV）；由部署者显式开启 */
 export function allowLivePrivate(): boolean {
-  return process.env.LIVE_ALLOW_PRIVATE === '1';
+  return !isWorkersRuntime() && process.env.LIVE_ALLOW_PRIVATE === '1';
 }
 
 /**
@@ -238,6 +318,10 @@ export function installFetchSSRFProtection(): void {
     const ctx = ssrfStorage.getStore();
     if (!ctx || !ctx.active) {
       return originalFetch(input, init);
+    }
+
+    if (isWorkersRuntime()) {
+      return fetchWorkersPublic(originalFetch, input, init);
     }
 
     // 在受保护作用域内，如果未提供专属 dispatcher，自动注入安全专用的 Agent

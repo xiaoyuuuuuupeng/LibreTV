@@ -27,6 +27,17 @@ LibreTV Next.js 迁移版：免费在线视频聚合搜索与观看平台。基�
 
 ## 部署
 
+### Cloudflare Workers（实验性兼容）
+
+本节适用于已通过 Next.js 适配器部署到 Workers 的实例，不提供新的构建适配器或一键部署配置。受 SSRF 防护的请求在 Workers 中使用原生 fetch，避免 Undici 的 Node TLS `ALPNProtocols` 兼容性错误。
+
+- 在 Workers 设置中启用 `global_fetch_strictly_public`（不要启用 `global_fetch_private_origin`）；确保 Node.js 兼容与 DNS lookup 可用。参考 [Cloudflare compatibility flags](https://developers.cloudflare.com/workers/configuration/compatibility-flags/#global-fetch-strictly-public)。
+- 设置运行时变量 `LIBRETV_WORKERS_ALLOWED_ORIGINS`，例如 `https://example.com,https://api.example.org`。仅填部署者信任的完整 HTTPS origin（无路径、无末尾斜杠、无通配符）。未配置时默认拒绝所有受保护出站请求。重定向、播放 CDN、订阅等受保护请求涉及的其他可信 origin 也需要显式配置。
+- Workers 模式拒绝内网直播源（即使设置 `LIVE_ALLOW_PRIVATE=1`），拒绝字面量 IP、非 HTTPS、未授权 origin 和 DNS 校验失败。禁止原生自动跳转；需要跟随的请求由安全跳转工具逐跳检查。
+- 安全边界：Workers 原生 fetch 不提供 Undici 的连接级 DNS pinning，DNS 预检不能独立防止 DNS rebinding。必须使用上述公网路由 flag，并且只允许信任其 DNS 和内容的 origin；不要允许用户自行修改白名单，也不要部署在依赖 Worker 身份绕过鉴权的私有源站。若需要任意用户自定义域名或内网直播，继续使用 Node.js/Docker 的原有防护。
+- 此模式仍需在实际 Workers 预览部署中验证；没有改变 Node.js/Docker 默认请求实现。
+
+
 ### Docker（推荐）
 
 ```bash
